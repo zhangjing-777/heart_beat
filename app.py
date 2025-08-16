@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-import asyncpg
+import psycopg
+from psycopg.rows import dict_row
 import asyncio
 from datetime import datetime, timezone, timedelta
 import logging
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 DATABASE_CONFIG = {
     "host": os.getenv("DB_HOST"),
     "port": os.getenv("DB_PORT"),
-    "database": os.getenv("DB_NAME"),
+    "dbname": os.getenv("DB_NAME"),
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD")
 }
@@ -74,7 +75,9 @@ monitor_enabled = True  # 添加监听控制标志
 async def create_connection():
     """创建新的数据库连接"""
     try:
-        conn = await asyncpg.connect(**DATABASE_CONFIG)
+        conn = await psycopg.AsyncConnection.connect(**DATABASE_CONFIG)
+        # 设置行工厂为字典格式
+        conn.row_factory = dict_row
         return conn
     except Exception as e:
         logger.error(f"创建数据库连接失败: {e}")
@@ -82,7 +85,7 @@ async def create_connection():
 
 async def close_connection(conn):
     """关闭数据库连接"""
-    if conn and not conn.is_closed():
+    if conn and not conn.closed:
         try:
             await conn.close()
         except Exception as e:
@@ -96,9 +99,11 @@ async def lifespan(app: FastAPI):
     try:
         # 测试数据库连接
         test_conn = await create_connection()
-        result = await test_conn.fetchval("SELECT version()")
+        async with test_conn.cursor() as cur:
+            await cur.execute("SELECT version()")
+            result = await cur.fetchone()
         await close_connection(test_conn)
-        logger.info(f"数据库连接测试成功: {result[:50]}...")
+        logger.info(f"数据库连接测试成功: {result['version'][:50]}...")
         
         # 启动监控任务
         monitor_task = asyncio.create_task(monitor_heartbeat_task())
@@ -147,36 +152,42 @@ async def create_or_update_heartbeat(heartbeat: HeartBeatInput):
         # 使用事务确保数据一致性
         async with conn.transaction():
             # 检查记录是否存在
-            existing_record = await conn.fetchrow(
-                "SELECT id FROM heart_beat WHERE mac_address = $1",
-                heartbeat.mac_address
-            )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT id FROM heart_beat WHERE mac_address = %s",
+                    (heartbeat.mac_address,)
+                )
+                existing_record = await cur.fetchone()
             
             if existing_record:
                 # 更新beat_time
-                await conn.execute(
-                    "UPDATE heart_beat SET beat_time = $1 WHERE mac_address = $2",
-                    beat_time, heartbeat.mac_address
-                )
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE heart_beat SET beat_time = %s WHERE mac_address = %s",
+                        (beat_time, heartbeat.mac_address)
+                    )
                 logger.info(f"更新心跳记录: {heartbeat.mac_address}")
             else:
                 # 插入新记录
-                await conn.execute(
-                    """INSERT INTO heart_beat (ip_address, mac_address, sn, beat_time) 
-                       VALUES ($1, $2, $3, $4)""",
-                    heartbeat.ip_address, heartbeat.mac_address, 
-                    heartbeat.sn, beat_time
-                )
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """INSERT INTO heart_beat (ip_address, mac_address, sn, beat_time) 
+                           VALUES (%s, %s, %s, %s)""",
+                        (heartbeat.ip_address, heartbeat.mac_address, 
+                         heartbeat.sn, beat_time)
+                    )
                 logger.info(f"创建新心跳记录: {heartbeat.mac_address}")
             
             # 查询device_map表信息 - 使用SELECT *
-            device_info = await conn.fetchrow(
-                "SELECT * FROM device_map WHERE mac_address = $1",
-                heartbeat.mac_address
-            )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT * FROM device_map WHERE mac_address = %s",
+                    (heartbeat.mac_address,)
+                )
+                device_info = await cur.fetchone()
             
             if device_info:
-                return dict(device_info)
+                return device_info
             else:
                 return {
                     "message": "Heart beat recorded, but device not found in device_map",
@@ -196,16 +207,18 @@ async def get_heartbeat(mac_address: str):
     try:
         conn = await create_connection()
         
-        record = await conn.fetchrow(
-            """SELECT id, ip_address, mac_address, sn, beat_time, create_time 
-               FROM heart_beat WHERE mac_address = $1""",
-            mac_address
-        )
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """SELECT id, ip_address, mac_address, sn, beat_time, create_time 
+                   FROM heart_beat WHERE mac_address = %s""",
+                (mac_address,)
+            )
+            record = await cur.fetchone()
         
         if not record:
             raise HTTPException(status_code=404, detail="Heart beat record not found")
         
-        return dict(record)
+        return record
         
     except HTTPException:
         raise
@@ -222,13 +235,15 @@ async def list_heartbeats(limit: int = 100, offset: int = 0):
     try:
         conn = await create_connection()
         
-        records = await conn.fetch(
-            """SELECT id, ip_address, mac_address, sn, beat_time, create_time 
-               FROM heart_beat ORDER BY beat_time DESC LIMIT $1 OFFSET $2""",
-            limit, offset
-        )
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """SELECT id, ip_address, mac_address, sn, beat_time, create_time 
+                   FROM heart_beat ORDER BY beat_time DESC LIMIT %s OFFSET %s""",
+                (limit, offset)
+            )
+            records = await cur.fetchall()
         
-        return [dict(record) for record in records]
+        return records
         
     except Exception as e:
         logger.error(f"查询心跳记录列表失败: {e}")
@@ -245,10 +260,12 @@ async def update_heartbeat(mac_address: str, update_data: HeartBeatUpdate):
         
         async with conn.transaction():
             # 检查记录是否存在
-            existing_record = await conn.fetchrow(
-                "SELECT id FROM heart_beat WHERE mac_address = $1",
-                mac_address
-            )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT id FROM heart_beat WHERE mac_address = %s",
+                    (mac_address,)
+                )
+                existing_record = await cur.fetchone()
             
             if not existing_record:
                 raise HTTPException(status_code=404, detail="Heart beat record not found")
@@ -259,18 +276,18 @@ async def update_heartbeat(mac_address: str, update_data: HeartBeatUpdate):
             updated_field_names = []
             
             if update_data.ip_address is not None:
-                update_fields.append(f"ip_address = ${len(update_values) + 1}")
+                update_fields.append(f"ip_address = %s")
                 update_values.append(update_data.ip_address)
                 updated_field_names.append("ip_address")
             
             if update_data.sn is not None:
-                update_fields.append(f"sn = ${len(update_values) + 1}")
+                update_fields.append(f"sn = %s")
                 update_values.append(update_data.sn)
                 updated_field_names.append("sn")
             
             if update_data.beat_time is not None:
                 beat_time = datetime.fromisoformat(update_data.beat_time.replace('Z', '+00:00'))
-                update_fields.append(f"beat_time = ${len(update_values) + 1}")
+                update_fields.append(f"beat_time = %s")
                 update_values.append(beat_time)
                 updated_field_names.append("beat_time")
             
@@ -279,9 +296,10 @@ async def update_heartbeat(mac_address: str, update_data: HeartBeatUpdate):
             
             # 执行更新
             update_values.append(mac_address)
-            query = f"UPDATE heart_beat SET {', '.join(update_fields)} WHERE mac_address = ${len(update_values)}"
+            query = f"UPDATE heart_beat SET {', '.join(update_fields)} WHERE mac_address = %s"
             
-            await conn.execute(query, *update_values)
+            async with conn.cursor() as cur:
+                await cur.execute(query, update_values)
             
             return UpdateResponse(
                 updated_fields=updated_field_names,
@@ -303,13 +321,14 @@ async def delete_heartbeat(mac_address: str):
     try:
         conn = await create_connection()
         
-        result = await conn.execute(
-            "DELETE FROM heart_beat WHERE mac_address = $1",
-            mac_address
-        )
-        
-        if result == "DELETE 0":
-            raise HTTPException(status_code=404, detail="Heart beat record not found")
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM heart_beat WHERE mac_address = %s",
+                (mac_address,)
+            )
+            
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Heart beat record not found")
         
         return {"message": f"Heart beat record for MAC {mac_address} deleted successfully"}
         
@@ -346,48 +365,54 @@ async def monitor_heartbeat_task():
             # 使用事务确保数据一致性
             async with conn.transaction():
                 # 查找超时的设备
-                timeout_devices = await conn.fetch(
-                    """SELECT DISTINCT h.mac_address 
-                       FROM heart_beat h
-                       INNER JOIN device_map d ON h.mac_address = d.mac_address
-                       WHERE h.beat_time < $1 AND d.status != 'offline'""",
-                    timeout_threshold
-                )
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """SELECT DISTINCT h.mac_address 
+                           FROM heart_beat h
+                           INNER JOIN device_map d ON h.mac_address = d.mac_address
+                           WHERE h.beat_time < %s AND d.status != 'offline'""",
+                        (timeout_threshold,)
+                    )
+                    timeout_devices = await cur.fetchall()
                 
                 offline_count = 0
                 for device in timeout_devices:
                     mac_address = device['mac_address']
                     
-                    result = await conn.execute(
-                        "UPDATE device_map SET status = 'offline' WHERE mac_address = $1",
-                        mac_address
-                    )
-                    
-                    if result != "UPDATE 0":
-                        offline_count += 1
-                        logger.info(f"设备 {mac_address} 心跳超时，状态更新为offline")
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "UPDATE device_map SET status = 'offline' WHERE mac_address = %s",
+                            (mac_address,)
+                        )
+                        
+                        if cur.rowcount > 0:
+                            offline_count += 1
+                            logger.info(f"设备 {mac_address} 心跳超时，状态更新为offline")
                 
                 # 查找最近5分钟内有心跳的设备
-                online_devices = await conn.fetch(
-                    """SELECT DISTINCT h.mac_address 
-                       FROM heart_beat h
-                       INNER JOIN device_map d ON h.mac_address = d.mac_address
-                       WHERE h.beat_time >= $1 AND d.status = 'offline'""",
-                    timeout_threshold
-                )
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """SELECT DISTINCT h.mac_address 
+                           FROM heart_beat h
+                           INNER JOIN device_map d ON h.mac_address = d.mac_address
+                           WHERE h.beat_time >= %s AND d.status = 'offline'""",
+                        (timeout_threshold,)
+                    )
+                    online_devices = await cur.fetchall()
                 
                 online_count = 0
                 for device in online_devices:
                     mac_address = device['mac_address']
                     
-                    result = await conn.execute(
-                        "UPDATE device_map SET status = 'online' WHERE mac_address = $1",
-                        mac_address
-                    )
-                    
-                    if result != "UPDATE 0":
-                        online_count += 1
-                        logger.info(f"设备 {mac_address} 心跳恢复，状态更新为online")
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "UPDATE device_map SET status = 'online' WHERE mac_address = %s",
+                            (mac_address,)
+                        )
+                        
+                        if cur.rowcount > 0:
+                            online_count += 1
+                            logger.info(f"设备 {mac_address} 心跳恢复，状态更新为online")
                 
                 # 记录统计信息（只在有变化时记录）
                 if offline_count > 0 or online_count > 0:
@@ -425,7 +450,9 @@ async def health_check():
     conn = None
     try:
         conn = await create_connection()
-        db_status = await conn.fetchval("SELECT 1")
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT 1")
+            db_status = await cur.fetchone()
         
         return HealthResponse(
             status="healthy",
